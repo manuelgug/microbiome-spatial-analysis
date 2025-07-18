@@ -5,6 +5,8 @@
 
 A comprehensive R pipeline for modeling microbial diversity patterns using real environmental data layers, spatial statistics, and machine learning approaches.
 
+![predictions](https://github.com/manuelgug/microbiome-spatial-analysis/blob/main/imgs/diversity_environmental_driver.png "Predictions")
+
 ## 🌟 Overview
 
 This pipeline demonstrates advanced spatial analysis techniques for environmental microbiome research, combining:
@@ -174,11 +176,15 @@ xgb_params <- list(
 - **Mantel Test**: Correlates community dissimilarity with geographic distance
 - Conditional spatial cross-validation implementation
 
+![blocks](https://github.com/manuelgug/microbiome-spatial-analysis/blob/main/imgs/spatial_blocks.png "Spatial Blocks")
+
 ### 4. Machine Learning Pipeline
 - XGBoost regression for diversity prediction
 - Spatial vs. random cross-validation based on autocorrelation
 - Hyperparameter tuning and early stopping
 - Model validation and performance assessment
+
+![blocks](https://github.com/manuelgug/microbiome-spatial-analysis/blob/main/imgs/xgboost_rmse_plots.png "Model Performance")
 
 ### 5. Spatial Prediction
 - Apply trained models to environmental raster layers
