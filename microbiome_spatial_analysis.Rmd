@@ -1,0 +1,548 @@
+---
+output:
+  html_document: default
+  pdf_document: default
+---
+# Microbiome-Environment Spatial Analysis Pipeline
+
+**A comprehensive workflow for modeling microbial diversity using real environmental data and spatial cross-validation**
+
+---
+
+## Overview
+
+This analysis demonstrates a complete pipeline for modeling microbial diversity patterns across landscapes using real environmental data layers. The workflow incorporates:
+
+### 🌍 **Real Environmental Data Integration**
+- WorldClim climate layers (temperature, precipitation)
+- SoilGrids soil properties (pH, organic carbon)
+- Proper spatial resolution matching and resampling
+
+### 🔬 **Realistic Microbiome Simulation**
+- Environment-driven community composition
+- Multinomial count data with realistic sequencing depths
+- Phyloseq integration for standard microbiome workflows
+
+### 📊 **Spatial Statistics**
+- Moran's I test for spatial autocorrelation in diversity
+- Mantel test for distance-decay relationships
+- Conditional spatial cross-validation implementation
+
+### 🤖 **Machine Learning Best Practices**
+- XGBoost with hyperparameter tuning
+- Spatially-aware cross-validation when needed
+- Overfitting diagnostics and early stopping
+- Variable importance analysis
+
+### 🗺️ **Prediction and Visualization**
+- Large-scale spatial prediction mapping
+- Interactive leaflet visualizations
+- Model validation against environmental drivers
+
+---
+
+## Technical Skills Demonstrated
+
+- **R Programming**: Advanced data manipulation, statistical analysis, and visualization
+- **Spatial Analysis**: Raster processing, coordinate systems, spatial statistics
+- **Machine Learning**: XGBoost, cross-validation, model diagnostics
+- **Microbiome Analytics**: Phyloseq, diversity metrics, community ecology
+- **Data Visualization**: Static plots, interactive maps, diagnostic plots
+- **Reproducible Research**: Structured workflow, documentation, version control ready
+
+---
+
+The analysis focuses on Spain, simulating microbiome data on Catalonia that responds realistically to environmental gradients to predict alpha diversity of the country.
+
+---
+
+## Setup and Dependencies
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  cache = FALSE
+)
+```
+
+```{r libraries, message=FALSE}
+# ===========================
+# MICROBIOME + ENVIRONMENT PIPELINE (REAL ENV LAYERS + SOILGRIDS + SPATIAL CV)
+# ===========================
+library(phyloseq)
+library(vegan)
+library(tidyverse)
+library(sf)
+library(terra)
+library(geodata)
+library(xgboost)
+library(caret)
+library(leaflet)
+library(leafem)
+library(geodist)
+library(rnaturalearth)
+library(rnaturalearthhires)
+library(spdep)
+library(blockCV)
+library(geosphere)
+library(patchwork) 
+
+set.seed(42069)
+```
+
+---
+
+## 1. Study Area and Sample Design
+
+We generate random sampling locations across Catalonia, Spain to simulate a realistic field sampling campaign.
+
+```{r sample-design}
+# ===========================
+# 1) Simulate Metadata (Cataluña)
+# ===========================
+n_samples <- 100
+spain_states <- ne_states(country = "Spain", returnclass = "sf")
+catalonia    <- spain_states[spain_states$woe_name == "Cataluña", ]
+
+random_points <- st_sample(catalonia, size = n_samples)
+metadata <- st_coordinates(random_points) %>% as.data.frame()
+metadata$SampleID <- paste0("S", 1:n_samples)
+colnames(metadata) <- c("Longitude", "Latitude", "SampleID")
+rownames(metadata) <- metadata$SampleID
+
+cat("Generated", n_samples, "sampling locations across Catalonia\n")
+```
+
+---
+
+## 2. Environmental Data Acquisition
+
+We fetch real environmental data from two major global databases:
+
+### 2.1 WorldClim Climate Data
+- **BIO1**: Annual Mean Temperature (°C)
+- **BIO12**: Annual Precipitation (mm)
+
+### 2.2 SoilGrids Soil Properties
+- **pH**: Soil pH (H2O) at 5-15cm depth
+- **OC**: Organic Carbon Density at 5-15cm depth
+
+```{r environmental-data}
+# ===========================
+# 2) Fetch Real Env Data
+# ===========================
+# 2a) WorldClim (Temp & Precip)
+worldclim <- geodata::worldclim_global(var = "bio", res = 5, path = "worldclim_data")
+wc_layers <- worldclim[[c(1, 12)]] # BIO1 (== Temp) & BIO12 (== Precip)
+names(wc_layers) <- c("Temp", "Precip")
+
+# 2b) SoilGrids (pH & Organic Carbon)
+sg_layers <- geodata::soil_world(var = c("phh2o","ocd"), path="soilgrids_data", depth = 15, res = 5) ### THIS PULLS THE SOILGRIDS RASTERS (organic carbon and pH)
+sg_layers <- sg_layers[[c("phh2o_5-15cm", "ocd_5-15cm")]]
+names(sg_layers) <- c("pH","OC")
+
+# NOTE: for whatever reason, soil_world ignores res = 5, so i need to resample to match worldclim's and be able to merge. fine.
+res(wc_layers)
+res(sg_layers)
+sg_resampled <- terra::resample(sg_layers, wc_layers, method = "bilinear")
+
+# Combine all layers
+env_layers <- c(wc_layers, sg_resampled)
+
+# Extract for sample points
+pts_vect  <- vect(st_as_sf(metadata, coords=c("Longitude","Latitude"), crs=4326))
+env_data  <- terra::extract(env_layers, pts_vect)[,-1]
+metadata  <- bind_cols(metadata, env_data)
+
+# Remove samples with NA (probaly landed on marine areas where there's no soil ans such)
+valid_rows <- complete.cases(metadata)
+metadata   <- metadata[valid_rows, ]
+pts_vect   <- pts_vect[valid_rows, ]
+env_data   <- env_data[valid_rows, ]
+
+# update n_samples
+n_samples <- nrow(metadata)
+
+cat("Successfully extracted environmental data for", n_samples, "samples\n")
+cat("Environmental layers:", names(env_layers), "\n")
+```
+
+---
+
+## 3. Microbiome Data Simulation
+
+We simulate realistic microbiome count data where community composition is driven by environmental gradients, specifically pH in this case.
+
+```{r microbiome-simulation}
+# ===========================
+# 3) Simulate Microbiome Counts (driven by real env)
+# ===========================
+n_otus <- 1000
+
+# base abundances
+base_ab  <- rlnorm(n_otus, meanlog=4, sdlog=1)
+
+# pick variable!
+colnames(metadata)
+top_Var <- c("pH")
+var_distro <- 0.4
+
+# OTU responses
+top_Var_effect  <- rnorm(n_otus,0,var_distro) # strong effect. to soften, 0.1 or less
+
+# expected abundances
+expected_abund <- t(sapply(1:n_samples, function(j){
+  ba <- base_ab * exp(top_Var_effect     * metadata[[top_Var]][j])
+  ba / sum(ba)
+}))
+
+colnames(expected_abund) <- paste0("OTU",1:n_otus)
+rownames(expected_abund) <- metadata$SampleID
+
+# simulate sequencing depths and counts
+seq_depth <- rpois(n_samples, lambda=20000)
+otu_mat   <- sapply(1:n_samples, function(i){
+  rmultinom(1, size=seq_depth[i], prob=expected_abund[i,])
+})
+otu_mat   <- matrix(otu_mat, nrow=n_otus, dimnames=list(paste0("OTU",1:n_otus), metadata$SampleID))
+
+head(otu_mat)
+
+# MERGE METADATA AND MICROBIOME DATA TO CREATE THE PHYLOSEQ OBJECT
+ps <- phyloseq(
+  otu_table(otu_mat, taxa_are_rows = TRUE),
+  sample_data(metadata)
+)
+
+cat("Created phyloseq object with", n_otus, "OTUs and", n_samples, "samples\n")
+cat("Environmental driver selected as primary:", top_Var,"\n")
+```
+
+---
+
+## 4. Alpha Diversity Calculation
+
+We calculate Shannon and Simpson diversity indices for each sample.
+
+```{r diversity-calculation}
+# ===========================
+# 4) EStimate richness
+# ===========================
+div <- estimate_richness(ps, measures=c("Shannon","Simpson")) %>%
+  rownames_to_column("SampleID")
+div_data <- left_join(metadata, div, by="SampleID")
+
+head(div_data)
+
+cat("Shannon diversity range:", round(range(div_data$Shannon, na.rm = TRUE), 2), "\n")
+cat("Simpson diversity range:", round(range(div_data$Simpson, na.rm = TRUE), 3), "\n")
+```
+
+---
+
+## 5. Spatial Autocorrelation Analysis
+
+Before modeling, we test for spatial autocorrelation in our diversity data using two complementary approaches:
+
+### 5.1 Moran's I Test
+Tests for spatial autocorrelation in Shannon diversity values based on geographic proximity.
+
+### 5.2 Mantel Test
+Tests for correlation between community dissimilarity and geographic distance.
+
+```{r spatial-autocorrelation}
+# ===========================
+# 5) Spatial Autocorrelation Tests
+# ===========================
+# MORAN (on Shannon's div)
+coords     <- cbind(div_data$Longitude, div_data$Latitude)
+nb         <- spdep::knn2nb(spdep::knearneigh(coords, k=5))
+lw         <- spdep::nb2listw(nb, style="W")
+mor_test   <- spdep::moran.test(div_data$Shannon, lw)
+print(mor_test)
+
+# MANTEL 
+comm_dist <- phyloseq::distance(ps, method = "bray")
+coords <- cbind(div_data$Longitude, div_data$Latitude)
+geo_dist <- geosphere::distm(coords, fun = distHaversine) #unit is in meters
+geo_dist <- as.dist(geo_dist)
+mantel_test <- vegan::mantel(comm_dist, geo_dist, method = "pearson", permutations = 9999)
+print(mantel_test)
+
+# If significant autocorrelation by either moran or mantel, set up 5 spatial CV blocks
+if (mor_test$p.value < 0.05 | mantel_test$signif < 0.05){
+  
+  AUTOCORR = TRUE # for later ;)
+  
+  sf_data <- st_as_sf(div_data, coords = c("Longitude", "Latitude"), crs = 4326)
+  
+png("spatial_blocks.png", width = 800, height = 800, res = 150)
+
+blocks <- cv_spatial(
+  x = sf_data,
+  column = NULL,
+  k = 5,
+  size = 50000,   # block size in meters (50 km)
+  selection = "random",
+  seed = 420,
+  progress = FALSE
+)
+
+dev.off()
+
+plot(blocks)
+  
+  cat("Spatial autocorrelation detected: using spatial cross-validation\n")
+  
+} else{
+  
+  AUTOCORR = FALSE
+  
+  print("No spatial autocorrelation found.")
+  
+}
+```
+
+
+---
+
+## 6. Machine Learning Model Development
+
+We use XGBoost to predict Shannon diversity from environmental variables, employing spatial cross-validation if autocorrelation is detected.
+
+### 6.1 Model Training and Cross-Validation
+
+```{r model-training}
+# ===========================
+# 4) XGBoost Model (Spatially Aware if Needed)
+# ===========================
+model_data <- div_data %>% drop_na()
+
+# Check if we have enough data
+if (nrow(model_data) < 10) {
+  stop("Not enough valid data points for modeling. Check environmental data extraction.")
+}
+
+# Features and response
+X <- as.matrix(model_data[, c("Temp", "Precip", "pH", "OC")])
+y <- model_data$Shannon
+
+dtrain <- xgb.DMatrix(data = X, label = y)
+
+# define folds
+if (AUTOCORR) {
+  print("Created spatial folds.")
+  folds <- split(seq_along(y), blocks$folds_ids)
+} else {
+  print("Created regular folds.")
+  folds <- caret::createFolds(y, k = 5)
+}
+
+# XGBoost Cross-Validation
+params <- list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  eta = 0.05,
+  max_depth = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5
+)
+
+set.seed(420)
+cv <- xgb.cv(
+  params = params,
+  data = dtrain,
+  folds = folds,  # spatial or random folds
+  nrounds = 1000,
+  early_stopping_rounds = 20,
+  verbose = 0
+)
+
+cat("Cross-validation completed with", cv$best_iteration, "optimal rounds\n")
+```
+
+### 6.2 Model Diagnostics and Overfitting Assessment
+
+```{r model-diagnostics, fig.width=12, fig.height=4}
+# Overfitting Diagnostics
+best_iter <- cv$best_iteration
+eval_df <- cv$evaluation_log
+
+# Plot 1: Train vs Test RMSE Curves
+p1 <- ggplot(eval_df, aes(x = iter)) +
+  geom_line(aes(y = test_rmse_mean, color = "Test"), size = 1) +
+  geom_line(aes(y = train_rmse_mean, color = "Train"), size = 1) +
+  geom_vline(xintercept = best_iter, color = "darkgreen", linetype = "dashed", size = 1) +
+  annotate("text", x = best_iter, 
+           y = eval_df$test_rmse_mean[best_iter] + 0.02,
+           label = paste0("Gap: ", 
+                          round(eval_df$train_rmse_mean[best_iter] -
+                                eval_df$test_rmse_mean[best_iter], 4)),
+           color = "black", vjust = -0.5, size = 3.5) +
+  scale_color_manual(values = c("Test" = "red", "Train" = "blue")) +
+  labs(y = "RMSE", x = "Iterations", color = "Curve") +
+  theme_minimal() +
+  ggtitle("Train vs Test RMSE")
+
+# Plot 2: RMSE Gap
+eval_df$rmse_gap <- eval_df$train_rmse_mean - eval_df$test_rmse_mean
+
+p2 <- ggplot(eval_df, aes(x = iter, y = rmse_gap)) +
+  geom_line(color = "purple", size = 1) +
+  geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+  labs(y = "Train - Test RMSE", x = "Iterations") +
+  theme_minimal() +
+  ggtitle("RMSE Gap Across Iterations")
+
+combined_rmse <- p1 + p2 + plot_layout(ncol = 2)
+
+print(combined_rmse)
+
+ggsave("xgboost_rmse_plots.png", combined_rmse, width = 12, height = 6, dpi = 300)
+
+cat("Overfitting gap at best iteration:", round(eval_df$rmse_gap[best_iter], 4), "\n")
+```
+
+### 6.3 Final Model Training and Evaluation
+
+```{r final-model}
+# ============================
+# Train Final Model (using best nrounds)
+# ============================
+best_nrounds <- cv$best_iteration
+
+set.seed(42069)
+xgb_model <- xgboost(
+  params = params,
+  data = dtrain,
+  nrounds = best_nrounds,
+  verbose = 0
+)
+
+# Predictions & Evaluation (Train-Test Split) /random split only for evaluation metrics (not used for CV)
+set.seed(420)
+train_idx <- caret::createDataPartition(y, p = 0.7, list = FALSE)
+X_test  <- X[-train_idx, ]
+y_test  <- y[-train_idx]
+
+pred <- predict(xgb_model, newdata = X_test)
+correlation <- cor(y_test, pred)
+cat("Model performance (Shannon ~ predicted):", round(correlation, 6), "\n")
+
+# Variable Importance
+importance <- xgb.importance(model = xgb_model)
+par(mfrow = c(1, 1))
+print(importance)
+```
+
+```{r importance-plot, fig.width=8, fig.height=5}
+xgb.plot.importance(importance)
+```
+
+---
+
+## 7. Spatial Prediction and Mapping
+
+We apply our trained model to predict Shannon diversity across the entire Spanish landscape.
+
+```{r spatial-prediction}
+# ===========================
+# 6) Predict Over Spain Raster
+# ===========================
+# prepare raster, aggregate for speed
+spain_sf   <- ne_countries(country="Spain", returnclass="sf")
+env_crop   <- crop(env_layers, ext(spain_sf)) %>% mask(vect(spain_sf))
+env_agg    <- aggregate(env_crop, fact=2, fun=mean, na.rm=TRUE)
+
+# predict function
+pred_fun <- function(model, newdata){
+  mat <- as.matrix(data.frame(Temp=newdata[,1],
+                              Precip=newdata[,2],
+                              pH=newdata[,3],
+                              OC=newdata[,4]))
+  predict(model, mat)
+}
+
+# Pedict over raster using the trained XGBoost model
+predicted_map <- terra::predict(
+  env_agg, xgb_model,
+  fun = pred_fun,
+  na.rm = TRUE
+)
+
+# Set layer name
+names(predicted_map) <- "Shannon_Predicted"
+
+cat("Successfully generated predictions across Spain\n")
+```
+
+### 7.1 Model Validation: Prediction vs. Environmental Driver
+
+```{r validation-plot, fig.width=12, fig.height=5}
+## compare to variable used to create microbiome data. should be highly correlated!
+spain_map <- crop(env_layers[[top_Var]], predicted_map)
+spain_map <- resample(spain_map, predicted_map, method = "bilinear")
+spain_map <- mask(spain_map, predicted_map)
+
+# Convert rasters to data frames for ggplot
+pred_df <- as.data.frame(predicted_map, xy = TRUE)
+colnames(pred_df) <- c("LON", "LAT", "Shannon")
+
+spain_df <- as.data.frame(spain_map, xy = TRUE)
+colnames(spain_df) <- c("LON", "LAT", "Var")
+
+# Predicted Shannon Diversity
+p1 <- ggplot() +
+  geom_raster(data = pred_df, aes(x = LON, y = LAT, fill = Shannon)) +
+  scale_fill_viridis_c(option = "viridis", name = "Shannon") +
+  geom_point(data = div_data, aes(x = Longitude, y = Latitude),
+             color = "red", size = 1.5) +
+  theme_minimal() +
+  ggtitle("Predicted Shannon Diversity")
+
+# Environmental Driver (Top Variable)
+p2 <- ggplot() +
+  geom_raster(data = spain_df, aes(x = LON, y = LAT, fill = Var)) +
+  scale_fill_viridis_c(option = "viridis", name = top_Var) +
+  theme_minimal() +
+  ggtitle(paste("Environmental Driver:", top_Var))
+
+
+combined_plot <- p1 + p2 + plot_layout(ncol = 2)
+
+ggsave("diversity_environmental_driver.png", combined_plot,
+       width = 14, height = 6, dpi = 300)
+
+print(combined_plot)
+
+cat("Validation: Comparing predictions to", top_Var, "(the primary environmental driver). Should be highly correlated! \n")
+```
+
+---
+
+## 8. Interactive Visualization
+
+```{r interactive-map, fig.width=10, fig.height=8}
+# ===========================
+# 7) Interactive Map & Summary
+# ===========================
+# leaflet
+pal <- colorNumeric(terrain.colors(50), values(predicted_map), na.color="transparent")
+leaflet() %>%
+  addTiles() %>%
+  addRasterImage(predicted_map, colors=pal, opacity=0.7, group="Predicted Shannon") %>%
+  addCircleMarkers(data=st_as_sf(div_data, coords=c("Longitude","Latitude"),crs=4326),
+                   color="red", radius=5,
+                   popup=~paste0("Samp:", SampleID,
+                                 "<br>Shannon:",round(Shannon,2),
+                                 "<br>Temp:",round(Temp,1),
+                                 "<br>Precip:",round(Precip,0),
+                                 "<br>pH:",round(pH,2),
+                                 "<br>OC:",round(OC,1)),
+                   group="Samples") %>%
+  addLegend(pal=pal, values=values(predicted_map), title="Predicted Shannon", position="bottomright")
+```
