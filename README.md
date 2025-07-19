@@ -189,7 +189,6 @@ xgb_params <- list(
 ### 5. Spatial Prediction
 - Apply trained models to environmental raster layers
 - Generate landscape-scale diversity predictions
-- Uncertainty quantification and validation
 
 ![interactive](https://github.com/manuelgug/microbiome-spatial-analysis/blob/main/imgs/interactive_map.png "Interactive Map")
 
